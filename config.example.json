@@ -30,6 +30,8 @@
     "window_wait_seconds": 8,
     "print_dialog_wait_seconds": 3,
     "close_document_after_print": false,
-    "confirm_after_auto_print": true
+    "confirm_after_auto_print": true,
+    "print_action": "click",
+    "click_wait_seconds": 5
   }
 }

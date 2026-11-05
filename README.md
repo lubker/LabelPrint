@@ -73,7 +73,9 @@ and must be deployed with the web API Lambda.
 | `auto_print.enabled` | Default state of the *Auto print* checkbox. |
 | `auto_print.window_title` | Text that must appear in the Brady window title. |
 | `auto_print.window_wait_seconds` | How long to wait for that window after opening the template. |
-| `auto_print.print_dialog_wait_seconds` | Pause between `Ctrl+P` and `Enter`, so the print dialog is fully open. |
+| `auto_print.print_dialog_wait_seconds` | Pause after `Ctrl+P`, so the print screen is fully open. |
+| `auto_print.print_action` | `click` (default: click the taught Print button, see *Auto print*) or `enter` (the old Enter key). |
+| `auto_print.click_wait_seconds` | How long to look for the print window before giving up. |
 | `auto_print.close_document_after_print` | Send `Ctrl+W` after printing. |
 | `auto_print.confirm_after_auto_print` | With `confirm_mode: ask`, skip the Yes/No dialog when the keystrokes were sent. |
 
@@ -122,17 +124,37 @@ by making the login work; then fix the proxy rather than leaving it off.
 ## Auto print
 
 Brady Workstation has no command-line or API in the edition in use, so "auto
-print" simply types the shortcuts an operator would: bring the Brady window to
-the front, `Ctrl+P`, wait, `Enter`. Test it once with the checkbox ticked and
-Brady already open:
+print" does what an operator does: bring the Brady window to the front, press
+`Ctrl+P`, wait, and **click the Print button**. Enter alone does not print in
+Brady's print screen, so the tool has to be shown where that button is, once
+per station:
 
-- If the print dialog is still opening when `Enter` arrives, raise
-  `print_dialog_wait_seconds`.
-- If the label opens but nothing happens, check `window_title` against the
-  real title bar text and raise `window_wait_seconds`.
+1. Open any label in Brady Workstation and press `Ctrl+P`.
+2. In the label printer click **Teach print click…**, then **Start (5 s)**,
+   and hold the mouse over Brady's Print button (do not click) until the
+   countdown ends.
+
+The tool stores the program, the size of that window and the button's
+distance from the nearest corner in `print_click.json`, so the click still
+lands when the window opens somewhere else or a little larger. Teach it again
+after a Brady update that changes the print screen, or after changing the
+Windows display scaling or the Parallels window's resolution mode.
+
+Test it once with *Auto print* ticked:
+
+- If nothing happens after `Ctrl+P`, raise `print_dialog_wait_seconds` (the
+  print screen was not open yet) or `click_wait_seconds`.
+- If the log says the print window did not appear, the print screen is a
+  different size than when it was taught (more than 25 % off): teach again.
+- If the label opens but `Ctrl+P` does nothing, check `window_title` against
+  the real title bar text and raise `window_wait_seconds`.
 - If Brady keeps the previous document open and does not re-read the data
   file, enable `close_brady_before_open` with the right `brady_process_name`,
   or tick `close_document_after_print`.
+
+`auto_print.print_action: "enter"` brings back the old Enter key instead of
+the click. Without a taught click the tool falls back to Enter and says so in
+the log.
 
 While a print is in progress the queue is not refreshed and a second print is
 refused until the current one is confirmed or declined.

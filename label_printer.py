@@ -42,6 +42,7 @@ APP_TITLE = "4Power Label Printer"
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = BASE_DIR / "config.json"
 SESSION_FILE = BASE_DIR / "session.json"
+PRINT_CLICK_FILE = BASE_DIR / "print_click.json"
 IS_WINDOWS = platform.system() == "Windows"
 
 DEFAULT_CONFIG = {
@@ -71,6 +72,10 @@ DEFAULT_CONFIG = {
         "print_dialog_wait_seconds": 3,
         "close_document_after_print": False,
         "confirm_after_auto_print": True,
+        # After Ctrl+P: "click" = click the taught Print button (falls back to
+        # Enter when nothing is taught), "enter" = press Enter (the old way).
+        "print_action": "click",
+        "click_wait_seconds": 5,
     },
 }
 
@@ -408,6 +413,182 @@ def press_keys(*vks: int) -> None:
         time.sleep(0.05)
 
 
+# -- The taught "Print" click ---------------------------------------------
+# Brady Workstation's print screen does not print on Enter, so the operator
+# shows the tool the Print button once ("Teach print click..."). What is kept
+# is the window's program and size, and the button's distance from the
+# window's nearest corner - buttons stay put relative to that corner when a
+# window is resized or moved, so the click lands on it again.
+def teach_record(point: tuple[int, int], rect: tuple[int, int, int, int], exe: str, title: str) -> dict:
+    left, top, right, bottom = rect
+    x, y = point
+    return {
+        "exe": exe,
+        "title": title,
+        "width": right - left,
+        "height": bottom - top,
+        "anchor_x": "left" if x - left <= right - x else "right",
+        "anchor_y": "top" if y - top <= bottom - y else "bottom",
+        "dx_left": x - left, "dx_right": right - x,
+        "dy_top": y - top, "dy_bottom": bottom - y,
+    }
+
+
+def click_point(record: dict, rect: tuple[int, int, int, int]) -> tuple[int, int]:
+    left, top, right, bottom = rect
+    x = left + record["dx_left"] if record["anchor_x"] == "left" else right - record["dx_right"]
+    y = top + record["dy_top"] if record["anchor_y"] == "top" else bottom - record["dy_bottom"]
+    return x, y
+
+
+def size_matches(record: dict, rect: tuple[int, int, int, int], tolerance: float = 0.25) -> bool:
+    w, h = rect[2] - rect[0], rect[3] - rect[1]
+    return (abs(w - record["width"]) <= record["width"] * tolerance
+            and abs(h - record["height"]) <= record["height"] * tolerance)
+
+
+def pick_print_window(record: dict, windows: list[dict]) -> dict | None:
+    """The window to click in: windows are {hwnd, exe, rect, foreground} in
+    z-order (front first). The foreground one if it is the taught program at
+    about the taught size, else the front-most such window."""
+    exe = (record.get("exe") or "").lower()
+    candidates = [w for w in windows if (w["exe"] or "").lower() == exe and size_matches(record, w["rect"])]
+    for w in candidates:
+        if w.get("foreground"):
+            return w
+    return candidates[0] if candidates else None
+
+
+def load_print_click() -> dict | None:
+    try:
+        with open(PRINT_CLICK_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) and "anchor_x" in data else None
+    except (OSError, ValueError):
+        return None
+
+
+def save_print_click(record: dict) -> None:
+    with open(PRINT_CLICK_FILE, "w", encoding="utf-8") as fh:
+        json.dump(record, fh, indent=2)
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+def _window_rect(hwnd) -> tuple[int, int, int, int]:
+    r = _RECT()
+    ctypes.windll.user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(r))  # type: ignore[attr-defined]
+    return (r.left, r.top, r.right, r.bottom)
+
+
+def _window_title(hwnd) -> str:
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    buf = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(ctypes.c_void_p(hwnd), buf, 512)
+    return buf.value
+
+
+def _window_exe(hwnd) -> str:
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    pid = ctypes.c_ulong()
+    user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(pid))
+    handle = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = ctypes.c_ulong(1024)
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return Path(buf.value).name
+        return ""
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def window_under_cursor() -> tuple[tuple[int, int], int | None]:
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    user32.WindowFromPoint.argtypes = [_POINT]
+    user32.WindowFromPoint.restype = ctypes.c_void_p
+    user32.GetAncestor.restype = ctypes.c_void_p
+    pt = _POINT()
+    user32.GetCursorPos(ctypes.byref(pt))
+    hwnd = user32.WindowFromPoint(pt)
+    root = user32.GetAncestor(ctypes.c_void_p(hwnd), 2) if hwnd else None  # GA_ROOT
+    return (pt.x, pt.y), root
+
+
+def teach_print_click_now() -> dict:
+    """Record the Print button under the mouse cursor (Windows only)."""
+    (x, y), hwnd = window_under_cursor()
+    if not hwnd:
+        raise RuntimeError("No window under the mouse.")
+    record = teach_record((x, y), _window_rect(hwnd), _window_exe(hwnd), _window_title(hwnd))
+    save_print_click(record)
+    return record
+
+
+def visible_windows() -> list[dict]:
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    fg = user32.GetForegroundWindow()
+    out: list[dict] = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)  # type: ignore[attr-defined]
+    def enum_proc(hwnd, _lparam):
+        if user32.IsWindowVisible(ctypes.c_void_p(hwnd)) and not user32.IsIconic(ctypes.c_void_p(hwnd)):
+            out.append({"hwnd": hwnd, "exe": _window_exe(hwnd), "rect": _window_rect(hwnd),
+                        "foreground": hwnd == fg})
+        return True
+
+    user32.EnumWindows(enum_proc, 0)  # EnumWindows walks the z-order, front first
+    return out
+
+
+def click_at(x: int, y: int) -> None:
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    old = _POINT()
+    user32.GetCursorPos(ctypes.byref(old))
+    user32.SetCursorPos(x, y)
+    time.sleep(0.15)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+    time.sleep(0.08)
+    user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+    time.sleep(0.15)
+    user32.SetCursorPos(old.x, old.y)
+
+
+def click_taught_print_button(settings: dict, log) -> bool:
+    record = load_print_click()
+    if not record:
+        return False
+    deadline = time.time() + float(settings.get("click_wait_seconds", 5))
+    target = None
+    while time.time() < deadline:
+        target = pick_print_window(record, visible_windows())
+        if target:
+            break
+        time.sleep(0.3)
+    if not target:
+        log(f"Auto print: the print window ({record.get('exe')}, about {record['width']}x{record['height']}) "
+            "did not appear - print manually, or teach the click again.")
+        return False
+    x, y = click_point(record, target["rect"])
+    user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    user32.SetForegroundWindow(ctypes.c_void_p(target["hwnd"]))
+    time.sleep(0.3)
+    log(f"Auto print: clicking Print at {x},{y}")
+    click_at(x, y)
+    return True
+
+
 def focus_window(hwnd) -> None:
     user32 = ctypes.windll.user32  # type: ignore[attr-defined]
     # Windows refuses SetForegroundWindow from a background process unless the
@@ -440,8 +621,14 @@ def auto_print(settings: dict, log) -> bool:
     log("Auto print: sending Ctrl+P")
     press_keys(VK_CONTROL, VK_P)
     time.sleep(float(settings.get("print_dialog_wait_seconds", 3)))
-    log("Auto print: sending Enter")
-    press_keys(VK_RETURN)
+    clicked = False
+    if settings.get("print_action", "click") == "click":
+        clicked = click_taught_print_button(settings, log)
+        if not clicked and not load_print_click():
+            log("Auto print: no Print click taught yet (button 'Teach print click...') - trying Enter.")
+    if not clicked:
+        log("Auto print: sending Enter")
+        press_keys(VK_RETURN)
     if settings.get("close_document_after_print"):
         time.sleep(2)
         hwnd = find_window(title)
@@ -528,6 +715,7 @@ def run_gui(config: dict) -> None:
                     command=lambda: toggle_print_new()).pack(side="left")
     ttk.Button(actions, text="Re-queue", command=lambda: requeue_selected()).pack(side="right")
     ttk.Button(actions, text="Mark as printed", command=lambda: confirm_selected()).pack(side="right", padx=6)
+    ttk.Button(actions, text="Teach print click…", command=lambda: teach_dialog()).pack(side="right", padx=6)
     ttk.Button(actions, text="Open CSV folder", command=lambda: open_file(resolve_path(config, config["csv_file"]).parent)).pack(side="right", padx=6)
 
     log_frame = ttk.LabelFrame(root, text="Log", padding=(6, 4))
@@ -769,6 +957,53 @@ def run_gui(config: dict) -> None:
             _append_log(f"Queued {result.get('label', {}).get('device_id')}")
             refresh()
         run_async(lambda: api.add(model.strip(), device_id.strip(), version.strip()), done)
+
+    def teach_dialog() -> None:
+        if not IS_WINDOWS:
+            messagebox.showinfo(APP_TITLE, "Teaching the print click needs Windows (Brady Workstation).")
+            return
+        dialog = tk.Toplevel(root)
+        dialog.title("Teach print click")
+        dialog.transient(root)
+        dialog.attributes("-topmost", True)
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack()
+        ttk.Label(frame, justify="left", text=(
+            "Shows the tool where Brady's Print button is. Once is enough.\n\n"
+            "1. Open a label in Brady Workstation and press Ctrl+P, so the\n"
+            "    screen with the Print button is showing.\n"
+            "2. Click Start below, then move the mouse onto the Print button\n"
+            "    and keep it there until the countdown ends. Do not click.")).pack(anchor="w")
+        count_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=count_var, font=("Segoe UI", 16, "bold")).pack(pady=8)
+        current = load_print_click()
+        if current:
+            ttk.Label(frame, foreground="#666666", text=(
+                f"Taught now: {current.get('exe')} - '{current.get('title')}' "
+                f"({current['width']}x{current['height']})")).pack(anchor="w")
+
+        def tick(n: int) -> None:
+            if n > 0:
+                count_var.set(f"Point at Print... {n}")
+                dialog.after(1000, lambda: tick(n - 1))
+                return
+            try:
+                record = teach_print_click_now()
+            except Exception as err:  # noqa: BLE001 - shown to the operator
+                count_var.set("")
+                messagebox.showerror(APP_TITLE, f"Could not record the click: {err}", parent=dialog)
+                return
+            count_var.set("Recorded")
+            _append_log(f"Print click taught: {record['exe']} '{record['title']}' "
+                        f"{record['width']}x{record['height']}, {record['anchor_y']}-{record['anchor_x']} corner")
+            messagebox.showinfo(APP_TITLE, (
+                f"Recorded the Print button in '{record['title']}' ({record['exe']}).\n\n"
+                "Auto print will now press Ctrl+P and click there. Print one label with "
+                "Auto print ticked to check it."), parent=dialog)
+            dialog.destroy()
+
+        ttk.Button(frame, text="Start (5 s)", command=lambda: tick(5)).pack(side="left", pady=(8, 0))
+        ttk.Button(frame, text="Close", command=dialog.destroy).pack(side="right", pady=(8, 0))
 
     def login_dialog() -> None:
         dialog = tk.Toplevel(root)
