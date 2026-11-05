@@ -61,6 +61,7 @@ DEFAULT_CONFIG = {
     "date_format": "%Y-%m-%d %H:%M:%S",
     "refresh_seconds": 15,
     "confirm_mode": "ask",
+    "print_new_automatically": False,
     "close_brady_before_open": False,
     "brady_process_name": "",
     "auto_print": {
@@ -264,6 +265,23 @@ class ApiClient:
 # ---------------------------------------------------------------------------
 # Label data -> CSV
 # ---------------------------------------------------------------------------
+def next_new_label(labels: list[dict], baseline_ids: set, tried_ids: set, config: dict) -> dict | None:
+    """The label "Print new labels automatically" should print next, or None.
+
+    Only labels that arrived after the option was switched on (not in
+    baseline_ids), so turning it on never prints an old backlog; never one it
+    already tried (a failed or declined print waits for the operator instead of
+    looping); never one without a label file. Oldest first, like the queue.
+    """
+    for label in labels:  # the API orders unprinted rows oldest first
+        if label.get("printed") or label.get("id") in baseline_ids or label.get("id") in tried_ids:
+            continue
+        if not label_file_name(config, label):
+            continue
+        return label
+    return None
+
+
 def format_timestamp(value: str | None, date_format: str) -> str:
     if not value:
         return ""
@@ -458,6 +476,10 @@ def run_gui(config: dict) -> None:
     show_printed = tk.BooleanVar(value=False)
     auto_refresh = tk.BooleanVar(value=True)
     auto_print_var = tk.BooleanVar(value=bool(config["auto_print"].get("enabled")))
+    print_new_var = tk.BooleanVar(value=bool(config.get("print_new_automatically")))
+    # Labels already queued when "print new" was switched on (None = not yet
+    # known: the next refresh fills it), and labels it has tried once.
+    auto_state: dict = {"baseline": None, "tried": set()}
     status_var = tk.StringVar(value="Not connected")
     pending_var = tk.StringVar(value="")
     labels_by_iid: dict[str, dict] = {}
@@ -502,6 +524,8 @@ def run_gui(config: dict) -> None:
     next_btn = ttk.Button(actions, text="Print next in queue", style="Big.TButton", command=lambda: print_next())
     next_btn.pack(side="left", padx=8)
     ttk.Checkbutton(actions, text="Auto print (Ctrl+P / Enter in Brady)", variable=auto_print_var).pack(side="left", padx=12)
+    ttk.Checkbutton(actions, text="Print new labels automatically", variable=print_new_var,
+                    command=lambda: toggle_print_new()).pack(side="left")
     ttk.Button(actions, text="Re-queue", command=lambda: requeue_selected()).pack(side="right")
     ttk.Button(actions, text="Mark as printed", command=lambda: confirm_selected()).pack(side="right", padx=6)
     ttk.Button(actions, text="Open CSV folder", command=lambda: open_file(resolve_path(config, config["csv_file"]).parent)).pack(side="right", padx=6)
@@ -587,6 +611,40 @@ def run_gui(config: dict) -> None:
             tree.selection_set(str(selected_id))
         pending_var.set(f"{data.get('pending', 0)} label(s) waiting")
         status_var.set(f"Connected as {api.email or api.user_id}")
+        maybe_print_new(data.get("labels", []))
+
+    def toggle_print_new() -> None:
+        auto_state["baseline"] = None  # re-read: only what arrives from now on
+        auto_state["tried"] = set()
+        if print_new_var.get():
+            _append_log("Print new labels automatically: on - labels already waiting are left for you.")
+            refresh()
+        else:
+            _append_log("Print new labels automatically: off")
+
+    def maybe_print_new(labels: list[dict]) -> None:
+        if not print_new_var.get():
+            return
+        if auto_state["baseline"] is None:
+            if show_printed.get():
+                return  # baseline from the unprinted list only
+            auto_state["baseline"] = {l.get("id") for l in labels if not l.get("printed")}
+            return
+        if busy["printing"]:
+            return
+        label = next_new_label(labels, auto_state["baseline"], auto_state["tried"], config)
+        if not label:
+            for l in labels:
+                if (not l.get("printed") and l.get("id") not in auto_state["baseline"]
+                        and l.get("id") not in auto_state["tried"] and not label_file_name(config, l)):
+                    auto_state["tried"].add(l.get("id"))
+                    _append_log(f"New label {l.get('device_id')} ({l.get('model')}) has no label file - not printed.")
+            return
+        auto_state["tried"].add(label["id"])
+        _append_log(f"New label: {label.get('device_id')} ({label.get('model')}) - printing")
+        tree.selection_set(str(label["id"]))
+        tree.see(str(label["id"]))
+        print_label(label)
 
     def auto_refresh_tick() -> None:
         if auto_refresh.get() and not busy["printing"]:

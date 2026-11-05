@@ -19,6 +19,7 @@
 
   "refresh_seconds": 15,
   "confirm_mode": "ask",
+  "print_new_automatically": false,
 
   "close_brady_before_open": false,
   "brady_process_name": "",

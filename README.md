@@ -68,6 +68,7 @@ and must be deployed with the web API Lambda.
 | `date_format` | Python `strftime` format for `Date`, in the PC's local time. |
 | `refresh_seconds` | Queue polling interval while "Auto refresh" is ticked. |
 | `confirm_mode` | `ask` (default: Yes/No dialog after the label opens), `auto` (mark printed as soon as the label is opened / auto-printed), `manual` (only the *Mark as printed* button). |
+| `print_new_automatically` | Default state of the *Print new labels automatically* checkbox (see below). |
 | `close_brady_before_open` + `brady_process_name` | Kill Brady Workstation before opening the next label so the data file is always re-read. Find the process name in Task Manager → Details. Off by default. |
 | `auto_print.enabled` | Default state of the *Auto print* checkbox. |
 | `auto_print.window_title` | Text that must appear in the Brady window title. |
@@ -75,6 +76,30 @@ and must be deployed with the web API Lambda.
 | `auto_print.print_dialog_wait_seconds` | Pause between `Ctrl+P` and `Enter`, so the print dialog is fully open. |
 | `auto_print.close_document_after_print` | Send `Ctrl+W` after printing. |
 | `auto_print.confirm_after_auto_print` | With `confirm_mode: ask`, skip the Yes/No dialog when the keystrokes were sent. |
+
+## Print new labels automatically
+
+With *Print new labels automatically* ticked, every label that arrives in the
+queue is printed by itself, oldest first, as soon as the next refresh sees it.
+Labels already waiting when the box is ticked are left for the operator, so
+switching it on never prints an old backlog. A label is tried once: if the
+print fails or the operator answers *No*, it stays in the queue for a manual
+print. Labels without a label file are skipped and logged.
+
+For a hands-free station combine it with *Auto print* (and
+`confirm_after_auto_print`), and lower `refresh_seconds` to 5. A device
+flashed with "Print label" on (the Pi station, or the Mac DeviceFlasher) then
+comes out of the printer a few seconds after the flash.
+
+### On a Mac (Parallels)
+
+Brady Workstation is Windows-only, so on a Mac it runs in a Parallels Windows
+VM, and this tool runs in the same VM (it types into Brady's window). The Mac
+DeviceFlasher runs on macOS itself, and the two meet in the cloud queue: no
+shared folder or network setting between them. In Parallels, set the Brady
+printer to connect to Windows and the flashing cables (USB-C boards, the
+serial adapter) to connect to the Mac, so the VM never takes a board that
+reconnects while it resets.
 
 ## Certificate error at login
 
